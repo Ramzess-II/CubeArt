@@ -1,0 +1,261 @@
+#include <math.h>
+#include <string.h> 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "driver/i2c.h"
+#include "led_strip.h"
+
+// Подключаем библиотеки DMP
+#include "I2Cdev.h"
+#include "MPU6050_6Axis_MotionApps20.h"
+
+// ==========================================
+// 1. НАСТРОЙКИ
+// ==========================================
+#define LED_GPIO            8
+#define LEDS_PER_FACE       9
+#define FACES_COUNT         6
+#define TOTAL_LEDS          (LEDS_PER_FACE * FACES_COUNT)
+#define LED_BRIGHTNESS      40
+
+#define PIN_SDA             5
+#define PIN_SCL             6
+
+static const char *TAG = "CUBE_DMP";
+static led_strip_handle_t led_strip;
+
+// Глобальный объект MPU6050. Он создается автоматически при старте.
+MPU6050 mpu;
+
+typedef struct { float w, x, y, z; } Quat;
+typedef struct { float x, y, z; } Vec3;
+typedef struct { uint8_t r, g, b; } Color;
+
+// ==========================================
+// 2. ЦВЕТА "МИРА"
+// ==========================================
+const Color WORLD_UP     = {255, 0, 0};    // Красный
+const Color WORLD_DOWN   = {0, 0, 255};    // Синий
+const Color WORLD_FRONT  = {0, 255, 0};    // Зеленый
+const Color WORLD_BACK   = {255, 255, 0};  // Желтый
+const Color WORLD_RIGHT  = {255, 0, 255};  // Фиолетовый
+const Color WORLD_LEFT   = {0, 128, 255};  // Бирюзовый
+
+Vec3 face_normals[FACES_COUNT] = {
+    {0, 0, 1},   // 0: Верхняя (Z+)
+    {0, 0, -1},  // 1: Нижняя (Z-)
+    {1, 0, 0},   // 2: Передняя (X+)
+    {-1, 0, 0},  // 3: Задняя (X-)
+    {0, 1, 0},   // 4: Правая (Y+)
+    {0, -1, 0}   // 5: Левая (Y-)
+};
+
+// ==========================================
+// 3. МАТЕМАТИКА
+// ==========================================
+float vec_dot(Vec3 a, Vec3 b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+// Фокусировка цвета (Гамма-коррекция)
+// Убирает белизну при смешивании
+float focus_curve(float val) {
+    if (val <= 0) return 0.0f;
+    return powf(val, 4.0f); // 4-я степень для контраста
+}
+
+Vec3 rotate_vector(Vec3 v, Quat q) {
+    float num2 = q.x * q.x;
+    float num3 = q.y * q.y;
+    float num4 = q.z * q.z;
+    float num5 = q.x * q.y;
+    float num6 = q.w * q.z;
+    float num7 = q.x * q.z;
+    float num8 = q.w * q.y;
+    float num9 = q.y * q.z;
+    float num10 = q.w * q.x;
+
+    Vec3 res;
+    res.x = (1.0f - 2.0f * (num3 + num4)) * v.x + (2.0f * (num5 - num6)) * v.y + (2.0f * (num7 + num8)) * v.z;
+    res.y = (2.0f * (num5 + num6)) * v.x + (1.0f - 2.0f * (num2 + num4)) * v.y + (2.0f * (num9 - num10)) * v.z;
+    res.z = (2.0f * (num7 - num8)) * v.x + (2.0f * (num9 + num10)) * v.y + (1.0f - 2.0f * (num2 + num3)) * v.z;
+    return res;
+}
+
+// ==========================================
+// 4. ИНИЦИАЛИЗАЦИЯ
+// ==========================================
+void init_leds(void) {
+    led_strip_config_t strip_config;
+    memset(&strip_config, 0, sizeof(strip_config)); 
+    strip_config.strip_gpio_num = LED_GPIO;
+    strip_config.max_leds = TOTAL_LEDS;
+    strip_config.led_model = LED_MODEL_WS2812;
+    strip_config.color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB;
+    strip_config.flags.invert_out = 0; 
+
+    led_strip_rmt_config_t rmt_config;
+    memset(&rmt_config, 0, sizeof(rmt_config));
+    rmt_config.clk_src = RMT_CLK_SRC_DEFAULT;
+    rmt_config.resolution_hz = 10 * 1000 * 1000; 
+    rmt_config.flags.with_dma = 0;
+
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
+    led_strip_clear(led_strip);
+}
+
+bool init_mpu_dmp(void) {
+    mpu.initialize();
+    
+    if (!mpu.testConnection()) {
+        ESP_LOGE(TAG, "MPU6050 connection failed");
+        return false;
+    }
+    ESP_LOGI(TAG, "MPU6050 connection successful");
+
+    ESP_LOGI(TAG, "Initializing DMP...");
+    uint8_t devStatus = mpu.dmpInitialize();
+
+    // Смещения (калибровка).
+    mpu.setXGyroOffset(220);
+    mpu.setYGyroOffset(76);
+    mpu.setZGyroOffset(-85);
+    mpu.setZAccelOffset(1788);
+
+    if (devStatus == 0) {
+        mpu.setDMPEnabled(true);
+        ESP_LOGI(TAG, "DMP enabled!");
+        return true;
+    } else {
+        ESP_LOGE(TAG, "DMP Initialization failed (code %d)", devStatus);
+        return false;
+    }
+}
+
+// ==========================================
+// 5. ОСНОВНОЙ ЦИКЛ
+// ==========================================
+void cube_task(void *pvParam) {
+    init_leds();
+    
+    i2c_config_t conf;
+    memset(&conf, 0, sizeof(conf));
+    conf.mode = I2C_MODE_MASTER;
+    conf.sda_io_num = PIN_SDA;
+    conf.scl_io_num = PIN_SCL;
+    conf.sda_pullup_en = GPIO_PULLUP_ENABLE;
+    conf.scl_pullup_en = GPIO_PULLUP_ENABLE;
+    conf.master.clk_speed = 400000;
+    
+    i2c_param_config(I2C_NUM_0, &conf);
+    i2c_driver_install(I2C_NUM_0, conf.mode, 0, 0, 0);
+
+    if (!init_mpu_dmp()) {
+        ESP_LOGE(TAG, "Critical failure. Halting.");
+        vTaskDelete(NULL);
+    }
+
+    uint16_t packetSize = mpu.dmpGetFIFOPacketSize();
+    uint8_t fifoBuffer[64];
+    
+    Quaternion q_raw; 
+    
+    Vec3 v_up    = {0, 0, 1};
+    Vec3 v_down  = {0, 0, -1};
+    Vec3 v_front = {1, 0, 0};
+    Vec3 v_back  = {-1, 0, 0};
+    Vec3 v_right = {0, 1, 0};
+    Vec3 v_left  = {0, -1, 0};
+
+    while(1) {
+        // 1. Получаем количество байт в буфере
+        uint16_t fifoCount = mpu.getFIFOCount();
+
+        // Если данных мало - ждем
+        if (fifoCount < packetSize) {
+            vTaskDelay(pdMS_TO_TICKS(1)); 
+            continue;
+        }
+
+        // Если переполнение (всё-таки случилось) - сбрасываем, но не рисуем этот кадр
+        if (fifoCount >= 1024) {
+            mpu.resetFIFO();
+            ESP_LOGW(TAG, "FIFO Overflow! Resetting.");
+            continue;
+        }
+
+        // 2. ВАЖНОЕ ИЗМЕНЕНИЕ: Вычитываем ВСЕ пакеты, оставляем только последний.
+        // Это гарантирует, что мы не отстаем от датчика и используем самые свежие данные.
+        while (fifoCount >= packetSize) {
+            mpu.getFIFOBytes(fifoBuffer, packetSize);
+            fifoCount -= packetSize;
+        }
+
+        // 3. Парсим кватернион
+        mpu.dmpGetQuaternion(&q_raw, fifoBuffer);
+        
+        // 4. ЗАЩИТА ОТ ГЛЮКОВ: Если пришел мусор (все нули), пропускаем кадр
+        if (q_raw.w == 0.0f && q_raw.x == 0.0f && q_raw.y == 0.0f && q_raw.z == 0.0f) {
+            continue;
+        }
+        
+        // Дальше старая логика...
+        Quat q_cube = {q_raw.w, q_raw.x, q_raw.y, q_raw.z};
+        Quat q_inv = {q_cube.w, -q_cube.x, -q_cube.y, -q_cube.z};
+
+        Vec3 local_up    = rotate_vector(v_up, q_inv);
+        Vec3 local_down  = rotate_vector(v_down, q_inv);
+        Vec3 local_front = rotate_vector(v_front, q_inv);
+        Vec3 local_back  = rotate_vector(v_back, q_inv);
+        Vec3 local_right = rotate_vector(v_right, q_inv);
+        Vec3 local_left  = rotate_vector(v_left, q_inv);
+
+        for (int i = 0; i < FACES_COUNT; i++) {
+            Vec3 normal = face_normals[i];
+            
+            float w_up    = focus_curve(vec_dot(normal, local_up));
+            float w_down  = focus_curve(vec_dot(normal, local_down));
+            float w_front = focus_curve(vec_dot(normal, local_front));
+            float w_back  = focus_curve(vec_dot(normal, local_back));
+            float w_right = focus_curve(vec_dot(normal, local_right));
+            float w_left  = focus_curve(vec_dot(normal, local_left));
+
+            float r_acc = 0, g_acc = 0, b_acc = 0;
+
+            auto mix = [&](Color c, float w) {
+                r_acc += c.r * w;
+                g_acc += c.g * w;
+                b_acc += c.b * w;
+            };
+
+            mix(WORLD_UP, w_up);
+            mix(WORLD_DOWN, w_down);
+            mix(WORLD_FRONT, w_front);
+            mix(WORLD_BACK, w_back);
+            mix(WORLD_RIGHT, w_right);
+            mix(WORLD_LEFT, w_left);
+
+            float max_val = fmaxf(r_acc, fmaxf(g_acc, b_acc));
+            if (max_val > 255.0f) {
+                float scale = 255.0f / max_val;
+                r_acc *= scale;
+                g_acc *= scale;
+                b_acc *= scale;
+            }
+
+            int start_idx = i * LEDS_PER_FACE;
+            for (int k = 0; k < LEDS_PER_FACE; k++) {
+                uint8_t r_final = (uint8_t)(r_acc * LED_BRIGHTNESS / 255.0f);
+                uint8_t g_final = (uint8_t)(g_acc * LED_BRIGHTNESS / 255.0f);
+                uint8_t b_final = (uint8_t)(b_acc * LED_BRIGHTNESS / 255.0f);
+                led_strip_set_pixel(led_strip, start_idx + k, r_final, g_final, b_final);
+            }
+        }
+        led_strip_refresh(led_strip);
+    }
+}
+
+extern "C" void app_main(void) {
+    xTaskCreate(cube_task, "cube_dmp", 8192, NULL, 5, NULL);
+}

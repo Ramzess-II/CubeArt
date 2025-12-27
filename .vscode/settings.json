@@ -19,6 +19,6 @@
     "led_strip.h": "c",
     "task.h": "c"
   },
-  "idf.portWin": "COM7",
+  "idf.portWin": "COM19",
   "idf.flashType": "UART"
 }

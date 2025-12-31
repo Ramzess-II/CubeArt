@@ -1,1 +1,4 @@
-Самое простое через онлайн тулзу (https://esptool.spacehuhn.com/), в папке build найти файл kubeLed.bin и закинуть по адрессу 0х10000
+Самое простое через онлайн тулзу (https://esptool.spacehuhn.com/), в папке bin взять файлы и закинуть их по таким адрессам:
+bootloader.bin по адрессу      0х00
+partition-table.bin по адрессу 0х8000
+kubeLed.bin по адрессу         0х10000

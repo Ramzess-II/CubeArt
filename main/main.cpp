@@ -26,25 +26,35 @@
 #define PIN_SCL             6
 
 #define DEBOUNCE_TIME_MS    50
-#define LONG_PRESS_MS       1500            // Время удержания для выкл
+#define LONG_PRESS_MS       1500            
 
-// Яркость режимов
+// Яркость режимов (0-255)
 #define BRIGHT_ACTIVE       100             
-#define BRIGHT_IDLE         30              
+#define BRIGHT_IDLE         30              // Можно вернуть повыше, т.к. дыхание само управляет яркостью
 #define BRIGHT_DICE         120
 #define BRIGHT_FLASHLIGHT   90              
 
-#define IDLE_TIMEOUT_MS     10000           // Время до засыпания (10 сек)
-#define IDLE_CHANGE_INTERVAL_MS (2 * 60 * 1000) // Смена idle эффекта каждые 2 минуты
+#define IDLE_TIMEOUT_MS     10000           
+#define IDLE_CHANGE_INTERVAL_MS (2 * 60 * 1000) 
 
 #define MOVE_THRESHOLD      4               
-#define INERTIA_FACTOR      0.03f           
+#define INERTIA_FACTOR      0.06f           
+
+// >>> МЕРТВАЯ ЗОНА (Deadzone) <<<
+// Угол (в градусах), в пределах которого цвет НЕ меняется.
+// 35 градусов - оптимально. 
+#define GRAVITY_DEADZONE_DEG 40.0f
+
+// ОФСЕТЫ
+#define OFFSET_X            0.0f
+#define OFFSET_Y            0.0f
+#define OFFSET_Z            0.0f
 
 // Скорости анимаций
 #define SCRAMBLE_SPEED_MS   400             
 #define MATRIX_SPEED_MS     120             
 #define SPARKLE_SPEED_MS    50
-#define BREATH_SPEED_MS     20              // Скорость перелива радуги
+// BREATH настраивается в функции
 
 // Настройки DICE / YESNO
 #define SHAKE_THRESHOLD     150             
@@ -104,15 +114,14 @@ Vec3 face_normals[FACES_COUNT] = {
     {0, 0, -1},  // 1
 };
 
-// Исправленные паттерны (классические кости)
 const uint8_t DICE_PATTERNS[7][9] = {
     {0,0,0, 0,0,0, 0,0,0}, 
     {0,0,0, 0,1,0, 0,0,0}, // 1
     {1,0,0, 0,0,0, 0,0,1}, // 2
     {1,0,0, 0,1,0, 0,0,1}, // 3
-    {1,0,1, 0,0,0, 1,0,1}, // 4 (Углы: 0,2,6,8)
-    {1,0,1, 0,1,0, 1,0,1}, // 5 (Углы + Центр: 0,2,4,6,8)
-    {1,0,1, 1,0,1, 1,0,1}  // 6 (Бока: 0,3,6 + 2,5,8)
+    {1,0,1, 0,0,0, 1,0,1}, // 4 
+    {1,0,1, 0,1,0, 1,0,1}, // 5 
+    {1,0,1, 1,0,1, 1,0,1}  // 6
 };
 
 const Color GAME_COLORS[3] = {
@@ -124,6 +133,13 @@ const Color GAME_COLORS[3] = {
 // ==========================================
 // 4. МАТЕМАТИКА
 // ==========================================
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// Порог для мертвой зоны (cos(35 градусов))
+const float DEADZONE_THRESHOLD = cosf(GRAVITY_DEADZONE_DEG * M_PI / 180.0f);
+
 void quat_normalize(Quat *q) {
     float mag = sqrtf(q->w*q->w + q->x*q->x + q->y*q->y + q->z*q->z);
     if (mag == 0) return;
@@ -145,7 +161,6 @@ Quat quat_lerp(Quat q_curr, Quat q_target, float t) {
 }
 
 float vec_dot(Vec3 a, Vec3 b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
-float focus_curve(float val) { return (val<=0)?0.0f : powf(val, 4.0f); }
 
 Vec3 rotate_vector(Vec3 v, Quat q) {
     float num2 = q.x * q.x; float num3 = q.y * q.y; float num4 = q.z * q.z;
@@ -164,7 +179,6 @@ void lerp_color(ColorF *curr, Color target, float speed) {
     curr->b += ((float)target.b - curr->b) * speed;
 }
 
-// Конвертер HSV -> RGB для радуги
 Color hsv2rgb(uint16_t h, uint8_t s, uint8_t v) {
     h %= 360;
     uint8_t rgb_max = v * 2.55f;
@@ -272,11 +286,28 @@ void sparkle_effect_step() {
     }
 }
 
-// --- Breath Logic (Радуга) ---
-static uint16_t breath_hue = 0;
-void breath_effect_step() {
-    breath_hue = (breath_hue + 1) % 360;
-    Color c = hsv2rgb(breath_hue, 100, 100);
+// --- Breath Logic (Исправлено: Синусоидальное дыхание) ---
+static float breath_phase = 0.0f; 
+static uint16_t breath_hue = 0;   
+
+void breath_effect_fade_in_out() {
+    // Двигаем фазу (скорость дыхания)
+    breath_phase += 0.02f;
+    
+    // Если полный цикл (затухло) -> меняем цвет
+    if (breath_phase > M_PI) {
+        breath_phase = 0.0f;
+        breath_hue = (uint16_t)(esp_random() % 360); 
+    }
+    
+    // Яркость по синусу: 0.05 ... 1.0
+    float sin_val = sinf(breath_phase);
+    float val_factor = 0.05f + (0.95f * sin_val); // от 5% до 100%
+    
+    // Базовая яркость цвета 100 (полная насыщенность), 
+    // но модулируем Value синусоидой
+    Color c = hsv2rgb(breath_hue, 100, (uint8_t)(val_factor * 100)); 
+    
     fill_all_faces(c);
 }
 
@@ -368,7 +399,7 @@ void task_cube(void *pvParam) {
 
     uint32_t last_move_time = xTaskGetTickCount();
     uint32_t last_anim_time = 0; 
-    uint32_t last_idle_change = 0; // Таймер смены режима ожидания
+    uint32_t last_idle_change = 0; 
     
     // Переменные DICE
     uint32_t shake_start_time = 0; 
@@ -389,7 +420,7 @@ void task_cube(void *pvParam) {
     CubeMode prev_loop_mode = MODE_GRAVITY;
     
     int dice_state = 0; 
-    int idle_effect_type = 0; // 0=Rubik, 1=Matrix, 2=Sparkle, 3=Breath
+    int idle_effect_type = 0; 
 
     float current_global_bright = BRIGHT_ACTIVE;
     bool snap_animation = false;
@@ -408,9 +439,9 @@ void task_cube(void *pvParam) {
         
         if (q_raw.w==0 && q_raw.x==0) continue;
 
-        Quat q_target = {q_raw.w, q_raw.x, q_raw.y, q_raw.z};
+        Quat q_target = {q_raw.w, q_raw.x + OFFSET_X, q_raw.y + OFFSET_Y, q_raw.z + OFFSET_Z};
+        quat_normalize(&q_target);
         
-        // --- Смена режима: Инициализация ---
         if (current_mode != prev_loop_mode) {
             if (current_mode == MODE_DICE) {
                 dice_state = 0; 
@@ -425,7 +456,6 @@ void task_cube(void *pvParam) {
                 yesno_blink_timer = xTaskGetTickCount();
                 yesno_toggle = false;
             }
-            
             prev_loop_mode = current_mode;
             last_move_time = xTaskGetTickCount(); 
         }
@@ -446,10 +476,8 @@ void task_cube(void *pvParam) {
             static bool was_idle = false;
             if (is_idle && !was_idle) {
                 was_idle = true;
-                // При входе в Idle выбираем случайный эффект
-                idle_effect_type = esp_random() % 4; // 0,1,2,3
+                idle_effect_type = esp_random() % 4; 
                 last_idle_change = now;
-                
                 if (idle_effect_type == 1 || idle_effect_type == 2) {
                     for(int i=0; i<TOTAL_LEDS; i++) target_leds[i] = (Color){0,0,0};
                 }
@@ -457,15 +485,13 @@ void task_cube(void *pvParam) {
                 was_idle = false;
             }
 
-            // Ротация режимов ожидания каждые 2 минуты
             if (is_idle && (now - last_idle_change > pdMS_TO_TICKS(IDLE_CHANGE_INTERVAL_MS))) {
-                idle_effect_type = esp_random() % 4;
+                int next_type = esp_random() % 4;
+                while(next_type == idle_effect_type) next_type = esp_random() % 4;
+                idle_effect_type = next_type;
                 last_idle_change = now;
-                
-                // Очистка для визуальной чистоты смены
-                if (idle_effect_type == 1 || idle_effect_type == 2) {
-                    for(int i=0; i<TOTAL_LEDS; i++) target_leds[i] = (Color){0,0,0};
-                }
+                if (idle_effect_type == 0) for(int f=0; f<FACES_COUNT; f++) fill_face_solid(f, PALETTE[f]);
+                else if (idle_effect_type == 1 || idle_effect_type == 2) for(int i=0; i<TOTAL_LEDS; i++) target_leds[i] = (Color){0,0,0};
             }
 
             float target_bri = is_idle ? BRIGHT_IDLE : BRIGHT_ACTIVE;
@@ -473,29 +499,17 @@ void task_cube(void *pvParam) {
             if (current_global_bright > target_bri) current_global_bright -= 0.5f;
 
             if (is_idle) {
-                if (idle_effect_type == 0) { // Rubik
-                    if (now - last_anim_time > pdMS_TO_TICKS(SCRAMBLE_SPEED_MS)) {
-                        scramble_move();
-                        last_anim_time = now;
-                    }
+                if (idle_effect_type == 0) { 
+                    if (now - last_anim_time > pdMS_TO_TICKS(SCRAMBLE_SPEED_MS)) { scramble_move(); last_anim_time = now; }
                 } 
-                else if (idle_effect_type == 1) { // Matrix
-                    if (now - last_anim_time > pdMS_TO_TICKS(MATRIX_SPEED_MS)) {
-                        matrix_effect_step();
-                        last_anim_time = now;
-                    }
+                else if (idle_effect_type == 1) { 
+                    if (now - last_anim_time > pdMS_TO_TICKS(MATRIX_SPEED_MS)) { matrix_effect_step(); last_anim_time = now; }
                 }
-                else if (idle_effect_type == 2) { // Sparkle
-                    if (now - last_anim_time > pdMS_TO_TICKS(SPARKLE_SPEED_MS)) {
-                        sparkle_effect_step();
-                        last_anim_time = now;
-                    }
+                else if (idle_effect_type == 2) { 
+                    if (now - last_anim_time > pdMS_TO_TICKS(SPARKLE_SPEED_MS)) { sparkle_effect_step(); last_anim_time = now; }
                 }
-                else { // Breath
-                    if (now - last_anim_time > pdMS_TO_TICKS(BREATH_SPEED_MS)) {
-                        breath_effect_step();
-                        last_anim_time = now;
-                    }
+                else { 
+                    breath_effect_fade_in_out(); 
                 }
             } else {
                 q_displayed = quat_lerp(q_displayed, q_target, INERTIA_FACTOR);
@@ -505,15 +519,40 @@ void task_cube(void *pvParam) {
                 l_dirs[2] = rotate_vector(v_front, q_inv); l_dirs[3] = rotate_vector(v_back, q_inv);
                 l_dirs[4] = rotate_vector(v_right, q_inv); l_dirs[5] = rotate_vector(v_left, q_inv);
                 Color cols[6] = {WORLD_UP, WORLD_DOWN, WORLD_FRONT, WORLD_BACK, WORLD_RIGHT, WORLD_LEFT};
+                
+                // >>> НОВАЯ ЛОГИКА СМЕШИВАНИЯ С НОРМАЛИЗАЦИЕЙ <<<
                 for(int i=0; i<FACES_COUNT; i++) {
                     Vec3 n = face_normals[i];
-                    float ra=0, ga=0, ba=0;
+                    float weights[6];
+                    float total_weight = 0.0f;
+                    
+                    // 1. Считаем веса для всех направлений
                     for(int w=0; w<6; w++) {
-                        float k = focus_curve(vec_dot(n, l_dirs[w]));
-                        ra+=cols[w].r*k; ga+=cols[w].g*k; ba+=cols[w].b*k;
+                        float dot = vec_dot(n, l_dirs[w]);
+                        
+                        // Если совпадение идеальное (> DEADZONE_THRESHOLD), то это победа
+                        if (dot > DEADZONE_THRESHOLD) {
+                            weights[w] = 1000.0f; // Огромный вес, перебьет все остальное
+                        } else if (dot > 0.0f) {
+                            // Иначе обычная степень для плавности
+                            weights[w] = powf(dot, 4.0f);
+                        } else {
+                            weights[w] = 0.0f;
+                        }
+                        total_weight += weights[w];
                     }
-                    float maxv = fmaxf(ra, fmaxf(ga, ba));
-                    if(maxv>255) { float s=255.0f/maxv; ra*=s; ga*=s; ba*=s; }
+
+                    // 2. Смешиваем и Нормализуем
+                    float ra=0, ga=0, ba=0;
+                    if (total_weight > 0.001f) {
+                        for(int w=0; w<6; w++) {
+                            float k = weights[w] / total_weight; // Нормализация (сумма всегда 1.0)
+                            ra += cols[w].r * k;
+                            ga += cols[w].g * k;
+                            ba += cols[w].b * k;
+                        }
+                    }
+
                     for(int k=0; k<9; k++) target_leds[i*9+k] = (Color){(uint8_t)ra, (uint8_t)ga, (uint8_t)ba};
                 }
             }

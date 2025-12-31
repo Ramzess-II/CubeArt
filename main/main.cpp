@@ -29,19 +29,22 @@
 #define LONG_PRESS_MS       1500            // Время удержания для выкл
 
 // Яркость режимов
-#define BRIGHT_ACTIVE       120             
-#define BRIGHT_IDLE         50              
+#define BRIGHT_ACTIVE       100             
+#define BRIGHT_IDLE         30              
 #define BRIGHT_DICE         120
-#define BRIGHT_FLASHLIGHT   90              // Яркость фонарика
+#define BRIGHT_FLASHLIGHT   90              
 
-#define IDLE_TIMEOUT_MS     10000           
+#define IDLE_TIMEOUT_MS     10000           // Время до засыпания (10 сек)
+#define IDLE_CHANGE_INTERVAL_MS (2 * 60 * 1000) // Смена idle эффекта каждые 2 минуты
+
 #define MOVE_THRESHOLD      4               
 #define INERTIA_FACTOR      0.03f           
 
 // Скорости анимаций
 #define SCRAMBLE_SPEED_MS   400             
 #define MATRIX_SPEED_MS     120             
-#define SPARKLE_SPEED_MS    50              
+#define SPARKLE_SPEED_MS    50
+#define BREATH_SPEED_MS     20              // Скорость перелива радуги
 
 // Настройки DICE / YESNO
 #define SHAKE_THRESHOLD     150             
@@ -50,7 +53,7 @@
 #define DICE_DEMO_OFF_MS    150             
 #define DICE_CHAOS_SPEED_MS 80              
 
-#define YESNO_INTRO_TIME_MS 3000            // Увеличили время вступления до 3 сек
+#define YESNO_INTRO_TIME_MS 3000            
 
 static const char *TAG = "CUBE_MAIN";
 static led_strip_handle_t led_strip;
@@ -62,8 +65,8 @@ MPU6050 mpu;
 typedef enum {
     MODE_GRAVITY = 0, 
     MODE_DICE,
-    MODE_YESNO,       // Новый режим "Да/Нет"
-    MODE_FLASHLIGHT,  // Новый режим "Фонарик"
+    MODE_YESNO,       
+    MODE_FLASHLIGHT,  
     MODE_COUNT        
 } CubeMode;
 
@@ -101,14 +104,15 @@ Vec3 face_normals[FACES_COUNT] = {
     {0, 0, -1},  // 1
 };
 
+// Исправленные паттерны (классические кости)
 const uint8_t DICE_PATTERNS[7][9] = {
     {0,0,0, 0,0,0, 0,0,0}, 
     {0,0,0, 0,1,0, 0,0,0}, // 1
     {1,0,0, 0,0,0, 0,0,1}, // 2
     {1,0,0, 0,1,0, 0,0,1}, // 3
-    {0,1,0, 1,0,1, 0,1,0}, // 4
-    {0,1,0, 1,1,1, 0,1,0}, // 5
-    {1,0,1, 1,0,1, 1,0,1}  // 6
+    {1,0,1, 0,0,0, 1,0,1}, // 4 (Углы: 0,2,6,8)
+    {1,0,1, 0,1,0, 1,0,1}, // 5 (Углы + Центр: 0,2,4,6,8)
+    {1,0,1, 1,0,1, 1,0,1}  // 6 (Бока: 0,3,6 + 2,5,8)
 };
 
 const Color GAME_COLORS[3] = {
@@ -158,6 +162,26 @@ void lerp_color(ColorF *curr, Color target, float speed) {
     curr->r += ((float)target.r - curr->r) * speed;
     curr->g += ((float)target.g - curr->g) * speed;
     curr->b += ((float)target.b - curr->b) * speed;
+}
+
+// Конвертер HSV -> RGB для радуги
+Color hsv2rgb(uint16_t h, uint8_t s, uint8_t v) {
+    h %= 360;
+    uint8_t rgb_max = v * 2.55f;
+    uint8_t rgb_min = rgb_max * (100 - s) / 100.0f;
+    uint8_t i = h / 60;
+    uint8_t diff = h % 60;
+    uint8_t rgb_adj = (rgb_max - rgb_min) * diff / 60;
+    uint8_t r=0, g=0, b=0;
+    switch(i) {
+    case 0: r=rgb_max; g=rgb_min+rgb_adj; b=rgb_min; break;
+    case 1: r=rgb_max-rgb_adj; g=rgb_max; b=rgb_min; break;
+    case 2: r=rgb_min; g=rgb_max; b=rgb_min+rgb_adj; break;
+    case 3: r=rgb_min; g=rgb_max-rgb_adj; b=rgb_max; break;
+    case 4: r=rgb_min+rgb_adj; g=rgb_min; b=rgb_max; break;
+    case 5: r=rgb_max; g=rgb_min; b=rgb_max-rgb_adj; break;
+    }
+    return (Color){r, g, b};
 }
 
 // ==========================================
@@ -248,6 +272,14 @@ void sparkle_effect_step() {
     }
 }
 
+// --- Breath Logic (Радуга) ---
+static uint16_t breath_hue = 0;
+void breath_effect_step() {
+    breath_hue = (breath_hue + 1) % 360;
+    Color c = hsv2rgb(breath_hue, 100, 100);
+    fill_all_faces(c);
+}
+
 // ==========================================
 // 6. ИНИЦИАЛИЗАЦИЯ И ЗАДАЧИ
 // ==========================================
@@ -336,6 +368,7 @@ void task_cube(void *pvParam) {
 
     uint32_t last_move_time = xTaskGetTickCount();
     uint32_t last_anim_time = 0; 
+    uint32_t last_idle_change = 0; // Таймер смены режима ожидания
     
     // Переменные DICE
     uint32_t shake_start_time = 0; 
@@ -348,15 +381,15 @@ void task_cube(void *pvParam) {
     // Переменные YESNO
     uint32_t yesno_timer = 0;
     uint32_t yesno_blink_timer = 0;
-    bool yesno_toggle = false; // Для мигания Red/Green
-    int yesno_state = 0; // 0=Intro, 1=Wait(Blue), 2=Thinking(Shake), 3=Result
+    bool yesno_toggle = false; 
+    int yesno_state = 0; 
     
     Quat q_prev = {0,0,0,0};
     Quat q_displayed = {1,0,0,0};
     CubeMode prev_loop_mode = MODE_GRAVITY;
     
     int dice_state = 0; 
-    int idle_effect_type = 0; 
+    int idle_effect_type = 0; // 0=Rubik, 1=Matrix, 2=Sparkle, 3=Breath
 
     float current_global_bright = BRIGHT_ACTIVE;
     bool snap_animation = false;
@@ -379,7 +412,6 @@ void task_cube(void *pvParam) {
         
         // --- Смена режима: Инициализация ---
         if (current_mode != prev_loop_mode) {
-            // Dice Init
             if (current_mode == MODE_DICE) {
                 dice_state = 0; 
                 demo_timer = xTaskGetTickCount();
@@ -387,14 +419,12 @@ void task_cube(void *pvParam) {
                 dice_demo_substate = 0; 
                 demo_color_idx = esp_random() % 3; 
             }
-            // YesNo Init
             else if (current_mode == MODE_YESNO) {
-                yesno_state = 0; // Intro
+                yesno_state = 0; 
                 yesno_timer = xTaskGetTickCount();
                 yesno_blink_timer = xTaskGetTickCount();
                 yesno_toggle = false;
             }
-            // Flashlight Init is simple (handled in loop)
             
             prev_loop_mode = current_mode;
             last_move_time = xTaskGetTickCount(); 
@@ -416,7 +446,10 @@ void task_cube(void *pvParam) {
             static bool was_idle = false;
             if (is_idle && !was_idle) {
                 was_idle = true;
-                idle_effect_type = esp_random() % 3; 
+                // При входе в Idle выбираем случайный эффект
+                idle_effect_type = esp_random() % 4; // 0,1,2,3
+                last_idle_change = now;
+                
                 if (idle_effect_type == 1 || idle_effect_type == 2) {
                     for(int i=0; i<TOTAL_LEDS; i++) target_leds[i] = (Color){0,0,0};
                 }
@@ -424,26 +457,43 @@ void task_cube(void *pvParam) {
                 was_idle = false;
             }
 
+            // Ротация режимов ожидания каждые 2 минуты
+            if (is_idle && (now - last_idle_change > pdMS_TO_TICKS(IDLE_CHANGE_INTERVAL_MS))) {
+                idle_effect_type = esp_random() % 4;
+                last_idle_change = now;
+                
+                // Очистка для визуальной чистоты смены
+                if (idle_effect_type == 1 || idle_effect_type == 2) {
+                    for(int i=0; i<TOTAL_LEDS; i++) target_leds[i] = (Color){0,0,0};
+                }
+            }
+
             float target_bri = is_idle ? BRIGHT_IDLE : BRIGHT_ACTIVE;
             if (current_global_bright < target_bri) current_global_bright += 0.5f;
             if (current_global_bright > target_bri) current_global_bright -= 0.5f;
 
             if (is_idle) {
-                if (idle_effect_type == 0) {
+                if (idle_effect_type == 0) { // Rubik
                     if (now - last_anim_time > pdMS_TO_TICKS(SCRAMBLE_SPEED_MS)) {
                         scramble_move();
                         last_anim_time = now;
                     }
                 } 
-                else if (idle_effect_type == 1) {
+                else if (idle_effect_type == 1) { // Matrix
                     if (now - last_anim_time > pdMS_TO_TICKS(MATRIX_SPEED_MS)) {
                         matrix_effect_step();
                         last_anim_time = now;
                     }
                 }
-                else {
+                else if (idle_effect_type == 2) { // Sparkle
                     if (now - last_anim_time > pdMS_TO_TICKS(SPARKLE_SPEED_MS)) {
                         sparkle_effect_step();
+                        last_anim_time = now;
+                    }
+                }
+                else { // Breath
+                    if (now - last_anim_time > pdMS_TO_TICKS(BREATH_SPEED_MS)) {
+                        breath_effect_step();
                         last_anim_time = now;
                     }
                 }
@@ -536,16 +586,13 @@ void task_cube(void *pvParam) {
             snap_animation = true;
 
             switch(yesno_state) {
-                case 0: // INTRO (Замедление)
+                case 0: // INTRO
                     {
-                        uint32_t elapsed = (now - yesno_timer) * portTICK_PERIOD_MS; // ms
+                        uint32_t elapsed = (now - yesno_timer) * portTICK_PERIOD_MS; 
                         if (elapsed > YESNO_INTRO_TIME_MS) {
-                            // Intro finished -> WAIT
                             yesno_state = 1;
                         } else {
-                            // Скорость падает экспоненциально
-                            // Стартуем с 40ms, замедляемся до 1000ms
-                            float progress = (float)elapsed / YESNO_INTRO_TIME_MS; // 0.0 -> 1.0
+                            float progress = (float)elapsed / YESNO_INTRO_TIME_MS; 
                             uint32_t period = 40 + (uint32_t)(progress * progress * progress * 800); 
                             
                             if (now - yesno_blink_timer > pdMS_TO_TICKS(period)) {
@@ -558,38 +605,34 @@ void task_cube(void *pvParam) {
                     }
                     break;
 
-                case 1: // WAIT (Blue)
+                case 1: // WAIT
                     fill_all_faces((Color){0, 0, 255});
                     if (motion > SHAKE_THRESHOLD) {
-                        yesno_state = 2; // THINKING
+                        yesno_state = 2; 
                         shake_start_time = now;
-                        yesno_blink_timer = 0; // Для мгновенного старта
+                        yesno_blink_timer = 0; 
                     }
                     break;
 
-                case 2: // THINKING (Fast Blink 10Hz = 100ms cycle -> 50ms toggle)
+                case 2: // THINKING
                     if (now - yesno_blink_timer > pdMS_TO_TICKS(50)) {
                         yesno_toggle = !yesno_toggle;
                         yesno_blink_timer = now;
                         Color c = yesno_toggle ? (Color){255,0,0} : (Color){0,255,0};
                         fill_all_faces(c);
                     }
-                    // 2 секунды думаем
                     if ((now - shake_start_time) > pdMS_TO_TICKS(2000)) {
-                        yesno_state = 3; // RESULT
-                        // Генерируем результат
-                        yesno_toggle = (esp_random() % 2) == 0; // Green or Red
+                        yesno_state = 3; 
+                        yesno_toggle = (esp_random() % 2) == 0; 
                     }
                     break;
 
                 case 3: // RESULT
                     {
-                        Color c = yesno_toggle ? (Color){0,255,0} : (Color){255,0,0}; // Yes(Gr) or No(Red)
+                        Color c = yesno_toggle ? (Color){0,255,0} : (Color){255,0,0}; 
                         fill_all_faces(c);
-                        
-                        // Если снова потрясли - реролл
                         if (motion > SHAKE_THRESHOLD) {
-                            yesno_state = 2; // THINKING
+                            yesno_state = 2; 
                             shake_start_time = now;
                         }
                     }
@@ -600,13 +643,6 @@ void task_cube(void *pvParam) {
         else if (current_mode == MODE_FLASHLIGHT) {
             current_global_bright = BRIGHT_FLASHLIGHT;
             snap_animation = true;
-            
-            // Включаем 2(Front), 4(Right), 5(Left)
-            // Индексы в face_normals:
-            // 2: X+ (Front)
-            // 4: Y+ (Right)
-            // 5: Y- (Left)
-            
             for(int i=0; i<TOTAL_LEDS; i++) target_leds[i] = (Color){0,0,0};
             
             fill_face_solid(2, (Color){255,255,255});
